@@ -1,0 +1,421 @@
+import cv2
+import numpy as np
+import mediapipe as mp
+
+from config import (
+    SQUAT_DOWN_ANGLE, SQUAT_UP_ANGLE,
+    PUSHUP_DOWN_ANGLE, PUSHUP_UP_ANGLE,
+    MIN_DOWN_HOLD_FRAMES, SHOW_SKELETON_DEFAULT, WINDOW_NAME
+)
+from pose_utils import safe_angle
+from exercises import SquatCounter, PushupCounter
+
+mp_drawing = mp.solutions.drawing_utils
+mp_styles = mp.solutions.drawing_styles
+mp_pose = mp.solutions.pose
+
+POSE_LM = mp_pose.PoseLandmark
+
+# Landmarks
+L_HIP, L_KNEE, L_ANKLE = POSE_LM.LEFT_HIP.value, POSE_LM.LEFT_KNEE.value, POSE_LM.LEFT_ANKLE.value
+R_HIP, R_KNEE, R_ANKLE = POSE_LM.RIGHT_HIP.value, POSE_LM.RIGHT_KNEE.value, POSE_LM.RIGHT_ANKLE.value
+L_SHOULDER, L_ELBOW, L_WRIST = POSE_LM.LEFT_SHOULDER.value, POSE_LM.LEFT_ELBOW.value, POSE_LM.LEFT_WRIST.value
+R_SHOULDER, R_ELBOW, R_WRIST = POSE_LM.RIGHT_SHOULDER.value, POSE_LM.RIGHT_ELBOW.value, POSE_LM.RIGHT_WRIST.value
+
+def draw_hud(frame, mode, reps, good_reps, feedback, show_skeleton):
+    h, w = frame.shape[:2]
+    cv2.rectangle(frame, (10, 10), (w-10, 120), (0,0,0), thickness=-1)
+    cv2.addWeighted(frame[10:120, 10:w-10], 0.4, np.zeros_like(frame[10:120, 10:w-10]), 0.6, 0, frame[10:120, 10:w-10])
+    cv2.putText(frame, f"Mode: {mode}", (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2)
+    cv2.putText(frame, f"Reps: {reps}  (Good: {good_reps})", (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
+    cv2.putText(frame, f"{feedback}", (w//2, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,0), 2)
+    cv2.putText(frame, f"[1] Squats  [2] Push-ups  [s] Toggle skeleton  [q] Quit", (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1)
+    if not show_skeleton:
+        cv2.putText(frame, "Skeleton: OFF", (w-200, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100,100,255), 2)
+
+def main():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: Cannot open webcam.")
+        return
+
+    mode = "Squats"
+    squat_counter = SquatCounter(SQUAT_DOWN_ANGLE, SQUAT_UP_ANGLE, MIN_DOWN_HOLD_FRAMES)
+    pushup_counter = PushupCounter(PUSHUP_DOWN_ANGLE, PUSHUP_UP_ANGLE, MIN_DOWN_HOLD_FRAMES)
+    show_skeleton = SHOW_SKELETON_DEFAULT
+
+    with mp_pose.Pose(
+        model_complexity=1,
+        enable_segmentation=False,
+        min_detection_confidence=0.6,
+        min_tracking_confidence=0.5
+    ) as pose:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.flip(frame, 1)
+            h, w = frame.shape[:2]
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = pose.process(rgb)
+
+            knee_angle = elbow_angle = None
+            squat_torso_angle = pushup_torso_angle = None
+            hip_y = shoulder_y = None
+
+            if results.pose_landmarks:
+                lms = results.pose_landmarks.landmark
+
+                # Squat → knee angle (min of both)
+                left_knee = safe_angle(lms, w, h, L_HIP, L_KNEE, L_ANKLE)
+                right_knee = safe_angle(lms, w, h, R_HIP, R_KNEE, R_ANKLE)
+                knee_angle = min(x for x in [left_knee, right_knee] if x is not None) if left_knee or right_knee else None
+
+                # Push-up → elbow angle (min of both)
+                left_elbow = safe_angle(lms, w, h, L_SHOULDER, L_ELBOW, L_WRIST)
+                right_elbow = safe_angle(lms, w, h, R_SHOULDER, R_ELBOW, R_WRIST)
+                elbow_angle = min(x for x in [left_elbow, right_elbow] if x is not None) if left_elbow or right_elbow else None
+
+                # ✅ Torso orientation
+                squat_torso_angle = safe_angle(lms, w, h, L_SHOULDER, L_HIP, L_KNEE)
+                pushup_torso_angle = safe_angle(lms, w, h, L_SHOULDER, L_HIP, L_ANKLE)
+
+                # ✅ Hip Y for squats
+                hip_y = (lms[L_HIP].y + lms[R_HIP].y) / 2
+
+                # ✅ Shoulder Y for push-ups
+                shoulder_y = (lms[L_SHOULDER].y + lms[R_SHOULDER].y) / 2
+
+                if show_skeleton:
+                    mp_drawing.draw_landmarks(
+                        frame,
+                        results.pose_landmarks,
+                        mp_pose.POSE_CONNECTIONS,
+                        landmark_drawing_spec=mp_styles.get_default_pose_landmarks_style()
+                    )
+
+            # Update counters
+            if mode == "Squats":
+                st = squat_counter.update(knee_angle, torso_angle=squat_torso_angle, hip_y=hip_y, shoulder_y=shoulder_y)
+            else:
+                st = pushup_counter.update(elbow_angle, torso_angle=pushup_torso_angle, shoulder_y=shoulder_y)
+
+            draw_hud(frame, mode, st.reps, st.good_reps, st.last_feedback, show_skeleton)
+
+            cv2.imshow(WINDOW_NAME, frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('1'):
+                mode = "Squats"
+            elif key == ord('2'):
+                mode = "Push-ups"
+            elif key == ord('s'):
+                show_skeleton = not show_skeleton
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    print("\n===== Workout Summary =====")
+    print(f"Squats: {squat_counter.state.reps}  (Good: {squat_counter.state.good_reps})")
+    print(f"Push-ups: {pushup_counter.state.reps}  (Good: {pushup_counter.state.good_reps})")
+    total_reps = squat_counter.state.reps + pushup_counter.state.reps
+    total_good = squat_counter.state.good_reps + pushup_counter.state.good_reps
+    if total_reps > 0:
+        print(f"Overall form quality: {int(100*total_good/max(1,total_reps))}%")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    from dataclasses import dataclass
+
+@dataclass
+class CounterState:
+    reps: int = 0
+    good_reps: int = 0
+    phase: str = "not_ready"   # 'not_ready', 'up', 'down'
+    down_frames: int = 0
+    last_feedback: str = "Get into starting position..."
+
+class BaseExerciseCounter:
+    def __init__(self, down_threshold, up_threshold, torso_check_fn=None,
+                 min_down_hold_frames=3, min_range_of_motion=40, min_rep_frames=10):
+        self.down_threshold = down_threshold
+        self.up_threshold = up_threshold
+        self.state = CounterState()
+        self.min_down_hold_frames = min_down_hold_frames
+        self.min_range_of_motion = min_range_of_motion
+        self.min_rep_frames = min_rep_frames
+        self.torso_check_fn = torso_check_fn
+
+        # Internal trackers
+        self.last_down_angle = None
+        self.rep_frame_counter = 0
+
+    def update(self, primary_angle, torso_angle=None):
+        fb = ""
+        self.rep_frame_counter += 1
+
+        if primary_angle is None:
+            self.state.last_feedback = "Move into frame"
+            return self.state
+
+        # Ready check
+        if self.state.phase == "not_ready":
+            if primary_angle >= self.up_threshold:
+                if self.torso_check_fn and not self.torso_check_fn(torso_angle):
+                    self.state.last_feedback = "Adjust body orientation"
+                else:
+                    self.state.phase = "up"
+                    self.state.last_feedback = "Ready ✅ Start exercise"
+                    self.rep_frame_counter = 0
+            else:
+                self.state.last_feedback = "Get into starting position..."
+            return self.state
+
+        # Up → going down
+        if self.state.phase == "up":
+            if primary_angle <= self.down_threshold:
+                self.state.phase = "down"
+                self.state.down_frames = 1
+                self.last_down_angle = primary_angle
+                self.rep_frame_counter = 0
+                fb = "Good depth" if primary_angle < (self.down_threshold - 5) else "Go a bit lower"
+            else:
+                fb = "Go lower"
+
+        # Down → going up
+        elif self.state.phase == "down":
+            if primary_angle <= self.down_threshold:
+                self.state.down_frames += 1
+                self.last_down_angle = primary_angle
+            if primary_angle >= self.up_threshold:
+                # ✅ Check stricter conditions
+                rom_ok = abs(self.up_threshold - self.last_down_angle) >= self.min_range_of_motion
+                time_ok = self.rep_frame_counter >= self.min_rep_frames
+                hold_ok = self.state.down_frames >= self.min_down_hold_frames
+
+                if rom_ok and time_ok:
+                    self.state.reps += 1
+                    if hold_ok:
+                        self.state.good_reps += 1
+                    fb = "Rep counted ✅"
+                else:
+                    fb = "Bad rep (too shallow/too fast)"
+                self.state.phase = "up"
+                self.rep_frame_counter = 0
+                self.state.down_frames = 0
+            else:
+                fb = "Hold… then extend"
+
+        self.state.last_feedback = fb
+        return self.state
+
+
+# ✅ Squats should have torso vertical
+def squat_torso_check(torso_angle):
+    if torso_angle is None:
+        return False
+    return 160 <= torso_angle <= 180  # upright
+
+
+# ✅ Push-ups should have torso horizontal
+def pushup_torso_check(torso_angle):
+    if torso_angle is None:
+        return False
+    return 150 <= torso_angle <= 180  # plank-ish
+
+
+class SquatCounter(BaseExerciseCounter):
+    def __init__(self, down_threshold=95, up_threshold=165,
+                 min_down_hold_frames=3, min_hip_drop=0.2,
+                 min_torso_angle=150):
+        super().__init__(down_threshold, up_threshold,
+                         torso_check_fn=None,
+                         min_down_hold_frames=min_down_hold_frames)
+        self.min_hip_drop = min_hip_drop
+        self.min_torso_angle = min_torso_angle
+        self.hip_y_standing = None
+        self.hip_y_lowest = None
+
+    def update(self, knee_angle, torso_angle=None, hip_y=None, shoulder_y=None):
+        state = super().update(knee_angle, torso_angle)
+
+        if hip_y is not None and shoulder_y is not None:
+            if self.state.phase == "up":
+                if self.hip_y_standing is None or hip_y < self.hip_y_standing:
+                    self.hip_y_standing = hip_y
+                self.hip_y_lowest = None
+            elif self.state.phase == "down":
+                if self.hip_y_lowest is None or hip_y > self.hip_y_lowest:
+                    self.hip_y_lowest = hip_y
+
+            # On rep completion
+            if self.state.last_feedback == "Rep counted ✅":
+                drop = (self.hip_y_lowest - self.hip_y_standing) if (self.hip_y_lowest and self.hip_y_standing) else 0
+                torso_ok = torso_angle is not None and torso_angle > self.min_torso_angle
+                depth_ok = drop >= self.min_hip_drop
+                knee_ok = knee_angle is not None and knee_angle <= self.down_threshold
+
+                if not torso_ok:
+                    self.state.reps -= 1; self.state.good_reps -= 1
+                    self.state.last_feedback = "Bad rep (leaning forward)"
+                elif not depth_ok:
+                    self.state.reps -= 1; self.state.good_reps -= 1
+                    self.state.last_feedback = "Bad rep (not enough hip drop)"
+                elif not knee_ok:
+                    self.state.reps -= 1; self.state.good_reps -= 1
+                    self.state.last_feedback = "Bad rep (knees not bent enough)"
+        return self.state
+
+
+class PushupCounter(BaseExerciseCounter):
+    def __init__(self, down_threshold=95, up_threshold=165,
+                 min_down_hold_frames=3, min_shoulder_drop=0.15,
+                 min_torso_angle=150):
+        super().__init__(down_threshold, up_threshold,
+                         torso_check_fn=None,
+                         min_down_hold_frames=min_down_hold_frames)
+        self.min_shoulder_drop = min_shoulder_drop
+        self.min_torso_angle = min_torso_angle
+        self.shoulder_y_highest = None
+        self.shoulder_y_lowest = None
+
+    def update(self, elbow_angle, torso_angle=None, shoulder_y=None, hip_y=None):
+        state = super().update(elbow_angle, torso_angle)
+
+        if shoulder_y is not None:
+            if self.state.phase == "up":
+                if self.shoulder_y_highest is None or shoulder_y < self.shoulder_y_highest:
+                    self.shoulder_y_highest = shoulder_y
+                self.shoulder_y_lowest = None
+            elif self.state.phase == "down":
+                if self.shoulder_y_lowest is None or shoulder_y > self.shoulder_y_lowest:
+                    self.shoulder_y_lowest = shoulder_y
+
+            if self.state.last_feedback == "Rep counted ✅":
+                drop = (self.shoulder_y_lowest - self.shoulder_y_highest) if (self.shoulder_y_lowest and self.shoulder_y_highest) else 0
+                torso_ok = torso_angle is not None and torso_angle > self.min_torso_angle
+                depth_ok = drop >= self.min_shoulder_drop
+                elbow_ok = elbow_angle is not None and elbow_angle <= self.down_threshold
+
+                if not torso_ok:
+                    self.state.reps -= 1; self.state.good_reps -= 1
+                    self.state.last_feedback = "Bad rep (back not flat)"
+                elif not depth_ok:
+                    self.state.reps -= 1; self.state.good_reps -= 1
+                    self.state.last_feedback = "Bad rep (not enough chest drop)"
+                elif not elbow_ok:
+                    self.state.reps -= 1; self.state.good_reps -= 1
+                    self.state.last_feedback = "Bad rep (elbows not bent enough)"
+        return self.state
